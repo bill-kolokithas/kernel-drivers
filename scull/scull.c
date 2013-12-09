@@ -1,5 +1,5 @@
 /*
- * main.c -- the bare scull char module
+ * scull.c -- the bare scull char module
  *
  * Copyright (C) 2001 Alessandro Rubini and Jonathan Corbet
  * Copyright (C) 2001 O'Reilly & Associates
@@ -17,18 +17,17 @@
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/init.h>
-
-#include <linux/kernel.h>	/* printk() */
-#include <linux/slab.h>		/* kmalloc() */
-#include <linux/fs.h>		/* everything... */
-#include <linux/errno.h>	/* error codes */
-#include <linux/types.h>	/* size_t */
-#include <linux/fcntl.h>	/* O_ACCMODE */
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/fs.h>
+#include <linux/errno.h>
+#include <linux/types.h>
+#include <linux/fcntl.h>
 #include <linux/cdev.h>
-
-#include <asm/uaccess.h>	/* copy_*_user */
-
-#include "scull.h"		/* local definitions */
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+#include <asm/uaccess.h>
+#include "scull.h"
 
 /*
  * Our parameters which can be set at load time.
@@ -52,6 +51,105 @@ MODULE_LICENSE("Dual BSD/GPL");
 struct scull_dev *scull_devices;	/* allocated in scull_init_module */
 
 
+#ifdef SCULL_DEBUG /* use proc only if debugging */
+/*
+ * The proc filesystem: function to read and entry
+ */
+static void *scull_seq_start(struct seq_file *s, loff_t *pos)
+{
+	if (*pos >= scull_nr_devs)
+		return NULL;   /* No more to read */
+
+	return scull_devices + *pos;
+}
+
+static void *scull_seq_next(struct seq_file *s, void *v, loff_t *pos)
+{
+	if (++(*pos) >= scull_nr_devs)
+		return NULL;
+
+	return scull_devices + *pos;
+}
+
+static void scull_seq_stop(struct seq_file *s, void *v)
+{
+	/* Actually, there's nothing to do here */
+}
+
+static int scull_seq_show(struct seq_file *s, void *v)
+{
+	struct scull_dev *dev = (struct scull_dev *) v;
+	struct scull_qset *d;
+	int i;
+
+	if (down_interruptible(&dev->sem))
+		return -ERESTARTSYS;
+
+	seq_printf(s, "\nDevice %i: qset %i, q %i, sz %li\n", (int) (dev - scull_devices),
+			dev->qset, dev->quantum, dev->size);
+
+	for (d = dev->data; d; d = d->next) { /* scan the list */
+		seq_printf(s, "  item at %p, qset at %p\n", d, d->data);
+		if (d->data && !d->next) { /* dump only the last item */
+			for (i = 0; i < dev->qset; i++) {
+				if (d->data[i])
+					seq_printf(s, "    % 4i: %8p\n", i, d->data[i]);
+			}
+		}
+	}
+	up(&dev->sem);
+	return 0;
+}
+
+/*
+ * Tie the sequence operators up.
+ */
+static struct seq_operations scull_seq_ops = {
+	.start = scull_seq_start,
+	.next  = scull_seq_next,
+	.stop  = scull_seq_stop,
+	.show  = scull_seq_show
+};
+
+/*
+ * Now to implement the /proc files we need only make an open
+ * method which sets up the sequence operators.
+ */
+
+static int scullseq_proc_open(struct inode *inode, struct file *file)
+{
+	return seq_open(file, &scull_seq_ops);
+}
+
+/*
+ * Create a set of file operations for our proc files.
+ */
+
+static struct file_operations scullseq_proc_ops = {
+	.owner   = THIS_MODULE,
+	.open    = scullseq_proc_open,
+	.read    = seq_read,
+	.llseek  = seq_lseek,
+	.release = seq_release
+};
+
+/*
+ * Actually create (and remove) the /proc file(s).
+ */
+
+static void scull_create_proc(void)
+{
+	proc_create("scullseq", 0, NULL, &scullseq_proc_ops);
+}
+
+static void scull_remove_proc(void)
+{
+	/* no problem if it was not registered */
+	remove_proc_entry("scullseq", NULL);
+}
+
+#endif /* SCULL_DEBUG */
+
 /*
  * Empty out the scull device; must be called with the device
  * semaphore held.
@@ -66,6 +164,7 @@ int scull_trim(struct scull_dev *dev)
 		if (dptr->data) {
 			for (i = 0; i < qset; i++)
 				kfree(dptr->data[i]);
+
 			kfree(dptr->data);
 			dptr->data = NULL;
 		}
@@ -93,6 +192,7 @@ int scull_open(struct inode *inode, struct file *filp)
 	if ( (filp->f_flags & O_ACCMODE) == O_WRONLY) {
 		if (down_interruptible(&dev->sem))
 			return -ERESTARTSYS;
+
 		scull_trim(dev); /* ignore errors */
 		up(&dev->sem);
 	}
@@ -110,11 +210,12 @@ static struct scull_qset *scull_follow(struct scull_dev *dev, int n)
 {
 	struct scull_qset *qs = dev->data;
 
-        /* Allocate first qset explicitly if need be */
+		/* Allocate first qset explicitly if need be */
 	if (! qs) {
 		qs = dev->data = kmalloc(sizeof(struct scull_qset), GFP_KERNEL);
 		if (qs == NULL)
 			return NULL;  /* Never mind */
+
 		memset(qs, 0, sizeof(struct scull_qset));
 	}
 
@@ -124,6 +225,7 @@ static struct scull_qset *scull_follow(struct scull_dev *dev, int n)
 			qs->next = kmalloc(sizeof(struct scull_qset), GFP_KERNEL);
 			if (qs->next == NULL)
 				return NULL;  /* Never mind */
+
 			memset(qs->next, 0, sizeof(struct scull_qset));
 		}
 		qs = qs->next;
@@ -207,6 +309,7 @@ ssize_t scull_write(struct file *filp, const char __user *buf, size_t count, lof
 		dptr->data = kmalloc(qset * sizeof(char *), GFP_KERNEL);
 		if (!dptr->data)
 			goto out;
+
 		memset(dptr->data, 0, qset * sizeof(char *));
 	}
 	if (!dptr->data[s_pos]) {
@@ -225,7 +328,7 @@ ssize_t scull_write(struct file *filp, const char __user *buf, size_t count, lof
 	*f_pos += count;
 	retval = count;
 
-        /* update the size */
+		/* update the size */
 	if (dev->size < *f_pos)
 		dev->size = *f_pos;
 
@@ -296,6 +399,10 @@ void scull_cleanup_module(void)
 		kfree(scull_devices);
 	}
 
+#ifdef SCULL_DEBUG /* use proc only if debugging */
+	scull_remove_proc();
+#endif
+
 	/* cleanup_module is never called if registering failed */
 	unregister_chrdev_region(devno, scull_nr_devs);
 }
@@ -338,7 +445,7 @@ int scull_init_module(void)
 		return result;
 	}
 
-        /*
+		/*
 	 * allocate the devices -- we can't have them static, as the number
 	 * can be specified at load time
 	 */
@@ -349,13 +456,17 @@ int scull_init_module(void)
 	}
 	memset(scull_devices, 0, scull_nr_devs * sizeof(struct scull_dev));
 
-        /* Initialize each device. */
+		/* Initialize each device. */
 	for (i = 0; i < scull_nr_devs; i++) {
 		scull_devices[i].quantum = scull_quantum;
 		scull_devices[i].qset = scull_qset;
 		sema_init(&scull_devices[i].sem, 1);
 		scull_setup_cdev(&scull_devices[i], i);
 	}
+
+#ifdef SCULL_DEBUG /* only when debugging */
+	scull_create_proc();
+#endif
 
 	return 0; /* succeed */
 
